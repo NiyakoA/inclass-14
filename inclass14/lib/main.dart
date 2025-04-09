@@ -1,122 +1,334 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'firebase_options.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-void main() {
-  runApp(const MyApp());
+/// -----------------------------------------------------------------
+/// 1. Background Message Handler
+/// -----------------------------------------------------------------
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // Ensure Firebase is initialized during background processing.
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  print("Background message received: ${message.messageId}");
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+/// -----------------------------------------------------------------
+/// 2. Global Local Notifications Plugin Instance
+/// -----------------------------------------------------------------
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
 
-  // This widget is the root of your application.
+/// -----------------------------------------------------------------
+/// 3. Main Function
+/// -----------------------------------------------------------------
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // Set background message handler.
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+  runApp(MyApp());
+}
+
+/// -----------------------------------------------------------------
+/// 4. The Top-Level App Widget
+/// -----------------------------------------------------------------
+class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'FCM Demo App',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: MyHomePage(title: 'Firebase Messaging Demo'),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
+/// -----------------------------------------------------------------
+/// 5. Model for Storing Notification History
+/// -----------------------------------------------------------------
+class NotificationItem {
   final String title;
+  final String body;
+  final String type; // e.g. 'regular' or 'important'
+  final DateTime receivedAt;
+  NotificationItem({
+    required this.title,
+    required this.body,
+    required this.type,
+    required this.receivedAt,
+  });
+}
 
+/// -----------------------------------------------------------------
+/// 6. Main Home Page with FCM and Extended Functionality
+/// -----------------------------------------------------------------
+class MyHomePage extends StatefulWidget {
+  MyHomePage({Key? key, required this.title}) : super(key: key);
+  final String title;
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  _MyHomePageState createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+  late FirebaseMessaging messaging;
+  String _fcmToken = "Token not yet fetched";
+  List<NotificationItem> _notificationHistory = [];
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+  @override
+  void initState() {
+    super.initState();
+    _initializeFCM();
+  }
+
+  // Initialize Firebase Messaging and Local Notifications.
+  void _initializeFCM() async {
+    // -----------------------------
+    // Configure Local Notifications
+    // -----------------------------
+    const AndroidInitializationSettings androidInitSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    final InitializationSettings initSettings =
+        InitializationSettings(android: androidInitSettings);
+    await flutterLocalNotificationsPlugin.initialize(
+      initSettings,
+      onSelectNotification: _onSelectNotification,
+    );
+
+    // -----------------------------
+    // Request Notification Permissions
+    // -----------------------------
+    messaging = FirebaseMessaging.instance;
+    NotificationSettings settings = await messaging.requestPermission(
+      alert: true, badge: true, sound: true,
+    );
+    print('User granted permission: ${settings.authorizationStatus}');
+
+    // -----------------------------
+    // Get FCM Token and Subscribe to Topic
+    // -----------------------------
+    messaging.getToken().then((token) {
+      setState(() {
+        _fcmToken = token ?? "Failed to get token";
+      });
+      print("FCM Token: $_fcmToken");
+    });
+    messaging.subscribeToTopic("messaging");
+
+    // -----------------------------
+    // Listen for Foreground Messages
+    // -----------------------------
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      print("Foreground message received: ${message.messageId}");
+      String notificationType = message.data['type'] ?? 'regular';
+      
+      // Show a local notification with characteristics based on type.
+      _showLocalNotification(message, notificationType);
+      
+      // Store the notification in history.
+      _storeNotification(message, notificationType);
+      
+      // Optionally, show a dialog.
+      if (message.notification != null) {
+        _showMessageDialog(
+          message.notification!.title ?? "Notification",
+          message.notification!.body ?? "",
+        );
+      }
+    });
+
+    // -----------------------------
+    // Handle Notification Taps (Deep Linking)
+    // -----------------------------
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+      print("Notification opened: ${message.messageId}");
+      _handleDeepLink(message);
     });
   }
 
+  // Show a simple dialog with notification details.
+  void _showMessageDialog(String title, String body) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(title),
+          content: Text(body),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text("OK")
+            )
+          ],
+        );
+      },
+    );
+  }
+
+  // Save notification details to a local history list.
+  void _storeNotification(RemoteMessage message, String type) {
+    final item = NotificationItem(
+      title: message.notification?.title ?? "No Title",
+      body: message.notification?.body ?? "No Body",
+      type: type,
+      receivedAt: DateTime.now(),
+    );
+    setState(() {
+      _notificationHistory.add(item);
+    });
+  }
+
+  // Display a local notification using flutter_local_notifications.
+  Future<void> _showLocalNotification(RemoteMessage message, String type) async {
+    RemoteNotification? notification = message.notification;
+    if (notification == null) return;
+
+    // Define channels for regular and important notifications.
+    const String channelRegular = 'regular_channel';
+    const String channelImportant = 'important_channel';
+    
+    const AndroidNotificationDetails regularDetails =
+        AndroidNotificationDetails(
+          channelRegular,
+          'Regular Notifications',
+          channelDescription: 'Channel for regular notifications',
+          importance: Importance.defaultImportance,
+          priority: Priority.defaultPriority,
+          icon: '@mipmap/ic_launcher',
+        );
+        
+    const AndroidNotificationDetails importantDetails =
+        AndroidNotificationDetails(
+          channelImportant,
+          'Important Notifications',
+          channelDescription: 'Channel for important notifications with sound & vibration',
+          importance: Importance.max,
+          priority: Priority.high,
+          icon: '@mipmap/ic_launcher',
+          sound: RawResourceAndroidNotificationSound('notification_sound'),
+          playSound: true,
+          enableVibration: true,
+        );
+        
+    AndroidNotificationDetails chosenDetails =
+        (type == 'important') ? importantDetails : regularDetails;
+        
+    NotificationDetails platformDetails =
+        NotificationDetails(android: chosenDetails);
+
+    // Use the data field 'deep_link' for deep linking actions.
+    await flutterLocalNotificationsPlugin.show(
+      notification.hashCode,
+      notification.title,
+      notification.body,
+      platformDetails,
+      payload: message.data['deep_link'] ?? "",
+    );
+  }
+
+  // Callback when a local notification is tapped.
+  Future _onSelectNotification(String? payload) async {
+    if (payload != null && payload.isNotEmpty) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => DeepLinkScreen(payload: payload)),
+      );
+    }
+  }
+
+  // Handle deep link navigation.
+  void _handleDeepLink(RemoteMessage message) {
+    String payload = message.data['deep_link'] ?? "";
+    if (payload.isNotEmpty) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => DeepLinkScreen(payload: payload)),
+      );
+    }
+  }
+
+  // Build the UI: Displays FCM token and allows access to notification history.
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
         title: Text(widget.title),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.history),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => NotificationHistoryScreen(history: _notificationHistory),
+                ),
+              );
+            },
+          )
+        ],
       ),
       body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-          ],
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text("FCM Token:", style: TextStyle(fontWeight: FontWeight.bold)),
+              Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Text(_fcmToken),
+              ),
+              SizedBox(height: 20),
+              Text("Waiting for notifications..."),
+            ],
+          ),
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+    );
+  }
+}
+
+/// -----------------------------------------------------------------
+/// 7. Deep Link Screen: Opened when a notification with a deep_link is tapped.
+/// -----------------------------------------------------------------
+class DeepLinkScreen extends StatelessWidget {
+  final String payload;
+  const DeepLinkScreen({Key? key, required this.payload}) : super(key: key);
+  
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text("Deep Link Page")),
+      body: Center(child: Text("Opened via deep link: $payload")),
+    );
+  }
+}
+
+/// -----------------------------------------------------------------
+/// 8. Notification History Screen: List of all received notifications.
+/// -----------------------------------------------------------------
+class NotificationHistoryScreen extends StatelessWidget {
+  final List<NotificationItem> history;
+  const NotificationHistoryScreen({Key? key, required this.history}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text("Notification History")),
+      body: history.isEmpty
+          ? Center(child: Text("No notifications received yet."))
+          : ListView.builder(
+              itemCount: history.length,
+              itemBuilder: (context, index) {
+                final item = history[index];
+                return ListTile(
+                  title: Text(item.title),
+                  subtitle: Text(item.body),
+                  trailing: Text(item.type),
+                );
+              },
+            ),
     );
   }
 }
