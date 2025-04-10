@@ -4,162 +4,144 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'firebase_options.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-/// -----------------------------------------------------------------
-/// 1. Background Message Handler
-/// -----------------------------------------------------------------
-Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  // Ensure Firebase is initialized during background processing.
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  print("Background message received: ${message.messageId}");
-}
-
-/// -----------------------------------------------------------------
-/// 2. Global Local Notifications Plugin Instance
-/// -----------------------------------------------------------------
+/// Global instance for local notifications.
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
-/// -----------------------------------------------------------------
-/// 3. Main Function
-/// -----------------------------------------------------------------
-Future<void> main() async {
+/// Top-level function to handle background notification responses.
+/// This is required for proper background handling on some platforms.
+@pragma('vm:entry-point')
+void notificationTapBackground(NotificationResponse notificationResponse) {
+  debugPrint('Background notification tapped with payload: ${notificationResponse.payload}');
+}
+
+/// Top-level function to handle background FCM messages.
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  debugPrint('Handling a background message: ${message.messageId}');
+}
+
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
-  // Set background message handler.
+  // Register the FCM background handler.
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
   runApp(MyApp());
 }
 
-/// -----------------------------------------------------------------
-/// 4. The Top-Level App Widget
-/// -----------------------------------------------------------------
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'FCM Demo App',
-      theme: ThemeData(primarySwatch: Colors.blue),
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+      ),
       home: MyHomePage(title: 'Firebase Messaging Demo'),
     );
   }
 }
 
-/// -----------------------------------------------------------------
-/// 5. Model for Storing Notification History
-/// -----------------------------------------------------------------
-class NotificationItem {
-  final String title;
-  final String body;
-  final String type; // e.g. 'regular' or 'important'
-  final DateTime receivedAt;
-  NotificationItem({
-    required this.title,
-    required this.body,
-    required this.type,
-    required this.receivedAt,
-  });
-}
-
-/// -----------------------------------------------------------------
-/// 6. Main Home Page with FCM and Extended Functionality
-/// -----------------------------------------------------------------
 class MyHomePage extends StatefulWidget {
-  MyHomePage({Key? key, required this.title}) : super(key: key);
   final String title;
+  MyHomePage({Key? key, required this.title}) : super(key: key);
+
   @override
   _MyHomePageState createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
   late FirebaseMessaging messaging;
-  String _fcmToken = "Token not yet fetched";
-  List<NotificationItem> _notificationHistory = [];
+  String? _fcmToken;
 
   @override
   void initState() {
     super.initState();
-    _initializeFCM();
+    _initializeLocalNotifications();
+    _initializeFirebaseMessaging();
   }
 
-  // Initialize Firebase Messaging and Local Notifications.
-  void _initializeFCM() async {
-    // -----------------------------
-    // Configure Local Notifications
-    // -----------------------------
+  /// Initializes the flutter_local_notifications plugin using the new callbacks.
+  Future<void> _initializeLocalNotifications() async {
     const AndroidInitializationSettings androidInitSettings =
         AndroidInitializationSettings('@mipmap/ic_launcher');
-    final InitializationSettings initSettings =
+
+    final InitializationSettings initializationSettings =
         InitializationSettings(android: androidInitSettings);
+
     await flutterLocalNotificationsPlugin.initialize(
-      initSettings,
-      onSelectNotification: _onSelectNotification,
+      initializationSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) {
+        final payload = response.payload;
+        if (payload != null && payload.isNotEmpty) {
+          _handleNotificationTap(payload);
+        }
+      },
+      onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
     );
+  }
 
-    // -----------------------------
-    // Request Notification Permissions
-    // -----------------------------
+  /// Configures Firebase Messaging.
+  void _initializeFirebaseMessaging() {
     messaging = FirebaseMessaging.instance;
-    NotificationSettings settings = await messaging.requestPermission(
-      alert: true, badge: true, sound: true,
-    );
-    print('User granted permission: ${settings.authorizationStatus}');
 
-    // -----------------------------
-    // Get FCM Token and Subscribe to Topic
-    // -----------------------------
+    // Retrieve the FCM token and store it.
     messaging.getToken().then((token) {
       setState(() {
-        _fcmToken = token ?? "Failed to get token";
+        _fcmToken = token;
       });
-      print("FCM Token: $_fcmToken");
+      debugPrint("FCM Token: $token");
     });
+
+    // Optionally subscribe to a topic.
     messaging.subscribeToTopic("messaging");
 
-    // -----------------------------
-    // Listen for Foreground Messages
-    // -----------------------------
+    // Handle foreground messages.
     FirebaseMessaging.onMessage.listen((RemoteMessage message) {
-      print("Foreground message received: ${message.messageId}");
-      String notificationType = message.data['type'] ?? 'regular';
-      
-      // Show a local notification with characteristics based on type.
-      _showLocalNotification(message, notificationType);
-      
-      // Store the notification in history.
-      _storeNotification(message, notificationType);
-      
-      // Optionally, show a dialog.
+      debugPrint('Foreground message received: ${message.messageId}');
       if (message.notification != null) {
-        _showMessageDialog(
+        _showForegroundDialog(
           message.notification!.title ?? "Notification",
-          message.notification!.body ?? "",
+          message.notification!.body ?? ""
         );
       }
     });
 
-    // -----------------------------
-    // Handle Notification Taps (Deep Linking)
-    // -----------------------------
+    // Handle when a user taps on a notification to open the app.
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
-      print("Notification opened: ${message.messageId}");
-      _handleDeepLink(message);
+      debugPrint('Notification opened: ${message.messageId}');
+      final deepLink = message.data['deep_link'] ?? "";
+      if (deepLink.isNotEmpty) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => DeepLinkScreen(payload: deepLink))
+        );
+      }
     });
   }
 
-  // Show a simple dialog with notification details.
-  void _showMessageDialog(String title, String body) {
+  /// Called when a notification is tapped.
+  void _handleNotificationTap(String payload) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => DeepLinkScreen(payload: payload))
+    );
+  }
+
+  /// Displays an AlertDialog when a message is received in the foreground.
+  void _showForegroundDialog(String title, String body) {
     showDialog(
       context: context,
-      builder: (context) {
+      builder: (BuildContext context) {
         return AlertDialog(
           title: Text(title),
           content: Text(body),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text("OK")
+              child: const Text("OK"),
+              onPressed: () => Navigator.of(context).pop(),
             )
           ],
         );
@@ -167,168 +149,40 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  // Save notification details to a local history list.
-  void _storeNotification(RemoteMessage message, String type) {
-    final item = NotificationItem(
-      title: message.notification?.title ?? "No Title",
-      body: message.notification?.body ?? "No Body",
-      type: type,
-      receivedAt: DateTime.now(),
-    );
-    setState(() {
-      _notificationHistory.add(item);
-    });
-  }
-
-  // Display a local notification using flutter_local_notifications.
-  Future<void> _showLocalNotification(RemoteMessage message, String type) async {
-    RemoteNotification? notification = message.notification;
-    if (notification == null) return;
-
-    // Define channels for regular and important notifications.
-    const String channelRegular = 'regular_channel';
-    const String channelImportant = 'important_channel';
-    
-    const AndroidNotificationDetails regularDetails =
-        AndroidNotificationDetails(
-          channelRegular,
-          'Regular Notifications',
-          channelDescription: 'Channel for regular notifications',
-          importance: Importance.defaultImportance,
-          priority: Priority.defaultPriority,
-          icon: '@mipmap/ic_launcher',
-        );
-        
-    const AndroidNotificationDetails importantDetails =
-        AndroidNotificationDetails(
-          channelImportant,
-          'Important Notifications',
-          channelDescription: 'Channel for important notifications with sound & vibration',
-          importance: Importance.max,
-          priority: Priority.high,
-          icon: '@mipmap/ic_launcher',
-          sound: RawResourceAndroidNotificationSound('notification_sound'),
-          playSound: true,
-          enableVibration: true,
-        );
-        
-    AndroidNotificationDetails chosenDetails =
-        (type == 'important') ? importantDetails : regularDetails;
-        
-    NotificationDetails platformDetails =
-        NotificationDetails(android: chosenDetails);
-
-    // Use the data field 'deep_link' for deep linking actions.
-    await flutterLocalNotificationsPlugin.show(
-      notification.hashCode,
-      notification.title,
-      notification.body,
-      platformDetails,
-      payload: message.data['deep_link'] ?? "",
-    );
-  }
-
-  // Callback when a local notification is tapped.
-  Future _onSelectNotification(String? payload) async {
-    if (payload != null && payload.isNotEmpty) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => DeepLinkScreen(payload: payload)),
-      );
-    }
-  }
-
-  // Handle deep link navigation.
-  void _handleDeepLink(RemoteMessage message) {
-    String payload = message.data['deep_link'] ?? "";
-    if (payload.isNotEmpty) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => DeepLinkScreen(payload: payload)),
-      );
-    }
-  }
-
-  // Build the UI: Displays FCM token and allows access to notification history.
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.title),
-        actions: [
-          IconButton(
-            icon: Icon(Icons.history),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => NotificationHistoryScreen(history: _notificationHistory),
-                ),
-              );
-            },
-          )
-        ],
       ),
       body: Center(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text("FCM Token:", style: TextStyle(fontWeight: FontWeight.bold)),
-              Padding(
-                padding: const EdgeInsets.all(8.0),
-                child: Text(_fcmToken),
-              ),
-              SizedBox(height: 20),
-              Text("Waiting for notifications..."),
-            ],
-          ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            const Text('Messaging Tutorial'),
+            const SizedBox(height: 20),
+            if (_fcmToken != null) Text('FCM Token: $_fcmToken'),
+          ],
         ),
       ),
     );
   }
 }
 
-/// -----------------------------------------------------------------
-/// 7. Deep Link Screen: Opened when a notification with a deep_link is tapped.
-/// -----------------------------------------------------------------
+/// Simple screen to display payload information when a deep link is tapped.
 class DeepLinkScreen extends StatelessWidget {
   final String payload;
   const DeepLinkScreen({Key? key, required this.payload}) : super(key: key);
-  
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text("Deep Link Page")),
-      body: Center(child: Text("Opened via deep link: $payload")),
-    );
-  }
-}
-
-/// -----------------------------------------------------------------
-/// 8. Notification History Screen: List of all received notifications.
-/// -----------------------------------------------------------------
-class NotificationHistoryScreen extends StatelessWidget {
-  final List<NotificationItem> history;
-  const NotificationHistoryScreen({Key? key, required this.history}) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text("Notification History")),
-      body: history.isEmpty
-          ? Center(child: Text("No notifications received yet."))
-          : ListView.builder(
-              itemCount: history.length,
-              itemBuilder: (context, index) {
-                final item = history[index];
-                return ListTile(
-                  title: Text(item.title),
-                  subtitle: Text(item.body),
-                  trailing: Text(item.type),
-                );
-              },
-            ),
+      appBar: AppBar(
+        title: const Text('Deep Link Screen'),
+      ),
+      body: Center(
+        child: Text('Payload: $payload'),
+      ),
     );
   }
 }
